@@ -12,9 +12,6 @@ from transformers import BertTokenizerFast, BertForTokenClassification, Wav2Vec2
 from typing import Dict, Any, List
 import random
 
-# from /kaggle/input/model-code/models import AcousticModel  # make sure models.py is in the same folder or on PYTHONPATH
-
-
 class AcousticModel(nn.Module):
     def __init__(self):
         super(AcousticModel, self).__init__()
