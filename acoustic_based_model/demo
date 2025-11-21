@@ -1,54 +1,44 @@
-import argparse
 import os
-
 import numpy as np
 import pandas as pd
 import torch
 import torchaudio
 import torch.nn as nn
-from transformers import WavLMModel
-from transformers import BertTokenizerFast, BertForTokenClassification, Wav2Vec2FeatureExtractor
+from transformers import WavLMModel, Wav2Vec2FeatureExtractor
+from typing import Dict, Any
+import argparse
 
-from typing import Dict, Any, List
-import random
+LABELS = ["FP", "RP", "RV", "RS", "PW"]
+SAMPLE_RATE = 16000  # WavLM expects 16k
+
+
+# ================ Model ================ #
 
 class AcousticModel(nn.Module):
     def __init__(self):
         super(AcousticModel, self).__init__()
-        self.basemodel = WavLMModel.from_pretrained('microsoft/wavlm-base')
+        self.basemodel = WavLMModel.from_pretrained("microsoft/wavlm-base")
         self.linear = nn.Linear(768, 5)
 
     def forward(self, x):
-        feats = self.basemodel.feature_extractor(x)
-        feats = feats.transpose(1, 2)
+        # x: [B, T_samples] after feature extractor
+        feats = self.basemodel.feature_extractor(x)      # [B, feature_dim, T']
+        feats = feats.transpose(1, 2)                    # [B, T', feature_dim]
         feats, _ = self.basemodel.feature_projection(feats)
-        emb = self.basemodel.encoder(feats, return_dict=True)[0]
-        out = self.linear(emb)
-
+        emb = self.basemodel.encoder(feats, return_dict=True)[0]  # [B, T_model, 768]
+        out = self.linear(emb)                           # [B, T_model, 5]
         return emb, out
-
-LABELS = ["FP", "RP", "RV", "RS", "PW"]
-SAMPLE_RATE = 16000            # WavLM expects 16k
-FRAMES_PER_SECOND = 50         # 20 ms frame grid (approx.)
 
 
 # ================ Audio & Metadata Helpers ================ #
 
 def extract_speaker_from_filename(audio_path: str) -> str:
-    """
-    E.g. '.../26f.wav' -> '26f'
-    """
     base = os.path.basename(audio_path)
     speaker_id = os.path.splitext(base)[0]
     return speaker_id
 
 
 def load_full_audio(audio_path: str, target_sr: int = SAMPLE_RATE) -> torch.Tensor:
-    """
-    Load full speaker audio (e.g. 26f.wav), mono, resampled to target_sr.
-
-    Returns waveform: [1, T]
-    """
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
@@ -66,11 +56,6 @@ def load_full_audio(audio_path: str, target_sr: int = SAMPLE_RATE) -> torch.Tens
 
 
 def load_metadata_for_speaker(metadata_path: str, speaker_id: str) -> pd.DataFrame:
-    """
-    Load metadata CSV and filter rows corresponding to this speaker.
-    Assumes metadata has columns: 'segid', 'segstart', 'segend'
-    and segid looks like '26f_000', '26f_001', etc.
-    """
     if metadata_path.endswith(".csv"):
         meta = pd.read_csv(metadata_path)
     else:
@@ -95,21 +80,21 @@ def load_metadata_for_speaker(metadata_path: str, speaker_id: str) -> pd.DataFra
     return speaker_meta
 
 
-# ================ Label Construction ================ #
+# ================ Label Construction on MODEL GRID ================ #
 
-def load_frame_labels_for_segment(
+def build_frame_labels_from_words(
     word_dir: str,
     segid: str,
     seg_start: float,
     seg_end: float,
-) -> np.ndarray:
+    n_frames_model: int,
+):
     """
-    Build frame-level labels (T_frames, 5) on a fixed FRAMES_PER_SECOND grid
-    for a given segment, using its word-level CSV.
+    Build frame-level labels directly on the model's frame grid.
 
-    Expects CSV: {word_dir}/{segid}.csv with columns:
-      wordstart, wordend, fp, rp, rv, pw
-    RS is assumed 0.
+    - n_frames_model = T_model from the WavLM output.
+    - We map frame k to a time in [0, duration] (segment-relative).
+    - If that time falls inside a word [wordstart, wordend), we assign that word's labels.
     """
     csv_path = os.path.join(word_dir, f"{segid}.csv")
     if not os.path.exists(csv_path):
@@ -120,7 +105,6 @@ def load_frame_labels_for_segment(
     for col in ["wordstart", "wordend"]:
         if col not in df.columns:
             raise ValueError(f"{csv_path} must contain '{col}' column.")
-
     for col in ["fp", "rp", "rv", "pw"]:
         if col not in df.columns:
             raise ValueError(f"{csv_path} must contain '{col}' column.")
@@ -131,41 +115,53 @@ def load_frame_labels_for_segment(
     rp = df["rp"].fillna(0).astype(int).to_numpy()
     rv = df["rv"].fillna(0).astype(int).to_numpy()
     pw = df["pw"].fillna(0).astype(int).to_numpy()
-    rs = np.zeros_like(fp)  # RS not annotated -> 0
+    rs = np.zeros_like(fp, dtype=int)  # RS not annotated
 
     duration = seg_end - seg_start
-    n_frames = max(1, int(duration * FRAMES_PER_SECOND))
-    frame_times = np.linspace(seg_start, seg_end, n_frames, endpoint=False)
 
-    labels = np.zeros((n_frames, len(LABELS)), dtype=np.float32)
+    # Model frame times: midpoints of equal bins over [0, duration]
+    frame_times_seg = (np.arange(n_frames_model) + 0.5) * duration / n_frames_model
+
+    # Detect whether word times are segment-relative or absolute
+    max_word_end = float(np.max(word_ends)) if len(word_ends) > 0 else 0.0
+    eps = 0.05  # 50 ms tolerance
+    if max_word_end <= duration + eps:
+        # Already relative [0, duration]
+        w_starts_seg = word_starts
+        w_ends_seg = word_ends
+    else:
+        # Absolute -> convert to segment-relative
+        w_starts_seg = word_starts - seg_start
+        w_ends_seg = word_ends - seg_start
+
+    labels = np.zeros((n_frames_model, len(LABELS)), dtype=np.float32)
 
     for i in range(len(df)):
-        w_start = word_starts[i]
-        w_end = word_ends[i]
+        w_start = w_starts_seg[i]
+        w_end = w_ends_seg[i]
 
-        # skip words outside this segment
-        if w_end <= seg_start or w_start >= seg_end:
+        # Skip words outside segment
+        if w_end <= 0.0 or w_start >= duration:
             continue
 
-        w_start_c = max(w_start, seg_start)
-        w_end_c = min(w_end, seg_end)
+        # Clamp to [0, duration]
+        w_start_c = max(w_start, 0.0)
+        w_end_c = min(w_end, duration)
 
-        mask = (frame_times >= w_start_c) & (frame_times < w_end_c)
+        # Frames whose time falls inside this word interval
+        mask = (frame_times_seg >= w_start_c) & (frame_times_seg < w_end_c)
         if not np.any(mask):
             continue
 
         lbl_vec = np.array([fp[i], rp[i], rv[i], rs[i], pw[i]], dtype=np.float32)
         labels[mask] = np.maximum(labels[mask], lbl_vec)
 
-    return labels  # [T_frames, 5]
+    return labels, frame_times_seg, df  # df is returned for word-level printing
 
 
 # ================ Metrics ================ #
 
 def compute_metrics(y_true: np.ndarray, y_logits: np.ndarray, threshold: float = 0.5) -> Dict[str, Any]:
-    """
-    Frame-level metrics.
-    """
     if y_true.size == 0:
         print("Warning: no frames to evaluate.")
         return {}
@@ -197,11 +193,7 @@ def compute_metrics(y_true: np.ndarray, y_logits: np.ndarray, threshold: float =
         t = y_true[:, i]
         p = y_pred[:, i]
         precision, recall, f1 = prf1(t, p)
-        results[LABELS[i]] = {
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-        }
+        results[LABELS[i]] = {"precision": precision, "recall": recall, "f1": f1}
         recalls.append(recall)
         f1s.append(f1)
 
@@ -223,7 +215,7 @@ def demo(
     speaker_id = extract_speaker_from_filename(audio_path)
     print(f"Speaker ID inferred from audio filename: {speaker_id}")
 
-    # 1. Load full audio at 16 kHz (SAMPLE_RATE)
+    # 1. Load full audio
     waveform = load_full_audio(audio_path, target_sr=SAMPLE_RATE)  # [1, T]
     waveform = waveform.to(device)
     num_samples = waveform.shape[-1]
@@ -231,11 +223,11 @@ def demo(
     print(f"Loaded audio: {audio_path}")
     print(f"  Duration: {duration_sec:.2f} seconds, samples: {num_samples}")
 
-    # 2. Load metadata rows for this speaker
+    # 2. Metadata
     meta_spk = load_metadata_for_speaker(metadata_path, speaker_id)
     print(f"Found {len(meta_spk)} segments for this speaker in metadata.\n")
 
-    # 3. Create feature extractor (same as original repo)
+    # 3. Feature extractor
     feature_extractor = Wav2Vec2FeatureExtractor(
         feature_size=1,
         sampling_rate=SAMPLE_RATE,
@@ -244,7 +236,7 @@ def demo(
         return_attention_mask=False,
     )
 
-    # 4. Load acoustic model with given weights
+    # 4. Model
     print(f"Loading acoustic model from: {weights_path}")
     model = AcousticModel()
     state_dict = torch.load(weights_path, map_location="cpu")
@@ -258,10 +250,10 @@ def demo(
     model.eval()
     print("Loaded finetuned acoustic model.\n")
 
-    # 5. Loop over segments and evaluate
     all_true = []
     all_logits = []
 
+    # 5. Loop over segments
     for idx, row in meta_spk.iterrows():
         segid = str(row["segid"])
         seg_start = float(row["segstart"])
@@ -269,7 +261,7 @@ def demo(
 
         print(f"Processing segment {segid}: [{seg_start:.2f}, {seg_end:.2f}] s")
 
-        # a) slice audio (already 16 kHz)
+        # Slice audio
         start_sample = int(seg_start * SAMPLE_RATE)
         end_sample = int(seg_end * SAMPLE_RATE)
         seg_wave = waveform[:, start_sample:end_sample]  # [1, T_seg]
@@ -278,67 +270,93 @@ def demo(
             print("  -> empty segment (no samples), skipping.")
             continue
 
-        # b) build frame-level ground truth
-        labels = load_frame_labels_for_segment(
+        # Feature extraction for this segment
+        seg_wave_mono_cpu = seg_wave[0].detach().cpu()
+        audio_feats = feature_extractor(
+            seg_wave_mono_cpu,
+            sampling_rate=SAMPLE_RATE
+        ).input_values[0]                      # 1D numpy
+        audio_feats = torch.tensor(audio_feats, dtype=torch.float32).unsqueeze(0).to(device)
+
+        # Forward through model
+        with torch.no_grad():
+            emb, output = model(audio_feats)   # output: [1, T_model, 5]
+
+        logits = output[0]                     # [T_model, 5]
+        T_model = logits.shape[0]
+
+        # Build GT on the model's frame grid
+        labels, frame_times_seg, df_words = build_frame_labels_from_words(
             word_dir=word_dir,
             segid=segid,
             seg_start=seg_start,
             seg_end=seg_end,
-        )  # [T_frames, 5]
+            n_frames_model=T_model,
+        )
 
-        # c) run through feature extractor + model (like run_acoustic_based)
-        #    feature extractor expects a 1D array, so drop channel dim
-        seg_wave_mono_cpu = seg_wave[0].detach().cpu()
+        logits_np = logits.cpu().numpy()
+        probs = 1.0 / (1.0 + np.exp(-logits_np))
+        preds = (probs >= threshold).astype(int)
 
-        audio_feats = feature_extractor(
-            seg_wave_mono_cpu,
-            sampling_rate=SAMPLE_RATE
-        ).input_values[0]                        # 1D numpy
-        audio_feats = torch.tensor(
-            audio_feats,
-            dtype=torch.float32
-        ).unsqueeze(0).to(device)               # [1, T_feat]
+        all_true.append(labels)
+        all_logits.append(logits_np)
 
-        with torch.no_grad():
-            # IMPORTANT: this assumes AcousticModel forward matches the original repo:
-            #   emb, output = model(audio_feats)
-            emb, output = model(audio_feats)
+        # # ---------- Frame-level print ----------
+        # print("  Frame-level GT vs Predictions (first 10 frames):")
+        # for i in range(min(10, T_model)):
+        #     gt_str = ", ".join(f"{LABELS[j]}={labels[i, j]:.0f}" for j in range(len(LABELS)))
+        #     pred_str = ", ".join(f"{LABELS[j]}={preds[i, j]:.0f}" for j in range(len(LABELS)))
+        #     print(f"    frame {i:03d}: GT[{gt_str}] | Pred[{pred_str}]")
 
-        # 'output' should be logits, shape [1, T_model, 5]
-        logits = output[0]  # [T_model, 5]
+        # ---------- Word-level summary (matches CSV rows) ----------
+        print("  Word-level GT vs Predictions:")
+        duration = seg_end - seg_start
+        for wi, word_row in df_words.iterrows():
+            w_start = float(word_row["wordstart"])
+            w_end = float(word_row["wordend"])
 
-        # d) align lengths: truncate to min(T_model, T_frames)
-        T_model = logits.shape[0]
-        T_true = labels.shape[0]
-        T_min = min(T_model, T_true)
+            # If for some reason they were absolute, correct them:
+            if w_end > duration + 0.05:
+                w_start = w_start - seg_start
+                w_end = w_end - seg_start
 
-        if T_min == 0:
-            print("  -> zero-length alignment, skipping.")
-            continue
+            if w_end <= 0.0 or w_start >= duration:
+                continue
 
-        logits_aligned = logits[:T_min].cpu().numpy()   # [T_min, 5]
-        labels_aligned = labels[:T_min]                 # [T_min, 5]
+            w_start_c = max(w_start, 0.0)
+            w_end_c = min(w_end, duration)
 
-        all_true.append(labels_aligned)
-        all_logits.append(logits_aligned)
+            # Which frames belong to this word?
+            mask = (frame_times_seg >= w_start_c) & (frame_times_seg < w_end_c)
+            if not np.any(mask):
+                continue
 
-        # Optional: print a few frame probabilities for the first segment
-        if idx == 0:
-            print("  Example frame probabilities (first 5 frames):")
-            probs = 1.0 / (1.0 + np.exp(-logits_aligned))  # sigmoid
-            for i in range(min(5, T_min)):
-                prob_str = ", ".join(
-                    f"{LABELS[j]}={probs[i, j]:.3f}"
-                    for j in range(len(LABELS))
-                )
-                print(f"    frame {i}: {prob_str}")
+            word_gt = np.array([
+                int(word_row.get("fp", 0) or 0),
+                int(word_row.get("rp", 0) or 0),
+                int(word_row.get("rv", 0) or 0),
+                0,
+                int(word_row.get("pw", 0) or 0),
+            ], dtype=int)
+
+            word_pred_probs = probs[mask].mean(axis=0)
+            word_pred = (word_pred_probs >= threshold).astype(int)
+
+            gt_str_w = ", ".join(f"{LABELS[j]}={word_gt[j]}" for j in range(len(LABELS)))
+            pred_str_w = ", ".join(f"{LABELS[j]}={word_pred[j]}" for j in range(len(LABELS)))
+
+            print(
+                f"    word '{word_row.get('word','')}' "
+                f"[{w_start_c:.2f},{w_end_c:.2f}]s: GT[{gt_str_w}] | Pred[{pred_str_w}]"
+            )
+
         print()
 
+    # 6. Global metrics
     if not all_true:
         print("No valid segments were processed; nothing to evaluate.")
         return
 
-    # 6. Concatenate over all segments and compute metrics
     y_true = np.concatenate(all_true, axis=0)   # [N_frames_total, 5]
     y_logits = np.concatenate(all_logits, axis=0)
 
