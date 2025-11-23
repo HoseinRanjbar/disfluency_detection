@@ -149,5 +149,54 @@ Fine-tuning on FluencyBank yielded consistent improvements across most disfluenc
 | **Macro Recall** | 0.6626 | **0.7112** |
 | **Macro F1** | 0.6513 | **0.7195** |
 
+## Acoustic_Based_Model
 
+### ✔️ 1. Loaded Original Switchboard Weights
+The model is initialized using the publicly released **Switchboard-trained acoustic model weights**, ensuring continuity with the original methodology.
+```bash
+!gdown --id 1wWrmopvvdhlBw-cL7EDyih9zn_IJu5Wr -O checkpoints/acoustic.pt
+```
+
+### ✔️ 2. Demo - Test a single audio file
+
+```bash
+!python /acoustic_based_model/demo.py --audio_path /voice-example/24fb.wav \
+ --metadata_path data/split/test_metadata.csv \
+ --word_dir data/FluencyBank_TimeStamped/csvs/csvs \
+ --weights_path checkpoints/language_fluencybank.pt 
+```
+
+### ✔️ 3. Fine-Tuned on FluencyBank
+Training design:
+- BCEWithLogitsLoss for multi-label prediction  
+- Step-based evaluation (every N training steps)  
+- Model selection based on **UAR**  
+- Early stopping using patience in evaluation steps  
+- Final checkpoint selected using best dev UAR
+
+```bash
+!python acoustic_model/train.py \
+    --train_metadata_path data/split/train_metadata.csv \
+    --dev_metadata_path data/split/val_metadata.csv \
+    --audio_dir data/FluencyBank_Wav \
+    --word_dir data/FluencyBank_TimeStamped/csvs/csvs \
+    --output_weights checkpoints/acoustic_fluencybank.pt \
+    --batch_size 4 \
+    --lr 1e-4 \
+    --eval_every 100 \
+    --patience_evals 10 \
+    --device cuda
+```
+
+### ✔️ 4. Evaluated the Model
+
+```bash
+!python acoustic_based_model/test.py \
+    --audio_dir data/FluencyBank_Wav \
+    --metadata_path data/split/test_metadata.csv \
+    --word_dir data/FluencyBank_TimeStamped/csvs/csvs \
+    --weights_path checkpoints/acoustic_fluencybank.pt \
+    --device cuda \
+    --threshold 0.5
+```
 
