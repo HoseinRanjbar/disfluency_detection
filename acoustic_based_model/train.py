@@ -2,6 +2,7 @@ import os
 import random
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple
+from tqdm import tqdm
 
 import numpy as np
 import pandas as pd
@@ -325,17 +326,17 @@ def train_fluencybank(
     word_dir: str,
     acoustic_checkpoint: str,    # e.g. "acoustic.pt" from original repo
     device: str = "cuda",
-    num_epochs: int = 15,        # as in paper (we'll early-stop anyway)
-    lr: float = 1e-5,            # smaller than 1e-4, good for small FluencyBank
-    eval_every: int = 100,       # evaluate every N segments
-    patience_evals: int = 50,    # patience in "eval calls", like paper
+    num_epochs: int = 15,        # as in paper
+    lr: float = 1e-5,            # you can try 1e-4, 5e-5, 1e-5
     threshold: float = 0.5,
     seed: int = 42,
+    patience_epochs: int = 5,    # early stopping after N epochs with no UAR improvement
     save_best_path: str = "best_fluencybank_wavlm.pt",
 ):
     """
     Train WavLM-base acoustic model on FluencyBank, starting from
     a Switchboard-fine-tuned acoustic.pt (which already includes the classifier).
+    Evaluation is done once at the end of each epoch.
     """
 
     # ----- seeds -----
@@ -355,7 +356,7 @@ def train_fluencybank(
     # ----- model -----
     model = AcousticModel()
 
-    # >>> Load pretrained acoustic model weights (WavLM + classifier) <<<
+    # Load pretrained acoustic model weights (WavLM + classifier)
     if not os.path.exists(acoustic_checkpoint):
         raise FileNotFoundError(f"acoustic_checkpoint not found: {acoustic_checkpoint}")
     print(f"Loading pretrained acoustic model from: {acoustic_checkpoint}")
@@ -382,15 +383,20 @@ def train_fluencybank(
     global_step = 0
     best_uar = -1.0
     best_metrics: Dict[str, Any] = {}
-    best_step = 0
-    eval_count_since_best = 0
+    best_epoch = 0
+    epochs_without_improve = 0
 
     for epoch in range(1, num_epochs + 1):
         print(f"\n===== Epoch {epoch}/{num_epochs} =====")
         model.train()
         random.shuffle(train_segments)
 
-        for seg in train_segments:
+        running_loss = 0.0
+        num_updates = 0
+
+        progress = tqdm(train_segments, desc=f"Epoch {epoch}/{num_epochs} - training", ncols=100)
+
+        for seg in progress:
             global_step += 1
 
             waveform = load_full_audio(seg.audio_path, target_sr=SAMPLE_RATE).to(device)
@@ -401,8 +407,8 @@ def train_fluencybank(
             if seg_wave.shape[-1] == 0:
                 continue
 
-            emb, logits = model(seg_wave)   # logits: [1, T_frames, 5]
-            logits = logits[0]              # [T_frames, 5]
+            emb, logits = model(seg_wave)   # [1, T_frames, 5]
+            logits = logits[0]
 
             labels_np = build_frame_labels_from_words(
                 word_dir=word_dir,
@@ -410,7 +416,7 @@ def train_fluencybank(
                 seg_start=seg.seg_start,
                 seg_end=seg.seg_end,
                 n_frames_model=logits.shape[0],
-            )                               # [T_frames, 5]
+            )
             labels = torch.from_numpy(labels_np).to(device)
 
             loss = criterion(logits, labels)
@@ -419,47 +425,61 @@ def train_fluencybank(
             loss.backward()
             optimizer.step()
 
-            if global_step % 20 == 0:
-                print(f"  step {global_step}: loss={loss.item():.4f}")
+            running_loss += loss.item()
+            num_updates += 1
 
-            # ---- dev eval & early stopping ----
-            if global_step % eval_every == 0:
-                print(f"\n  [Eval] step {global_step} on dev set...")
-                metrics_dev = evaluate(
-                    model=model,
-                    segments=dev_segments,
-                    word_dir=word_dir,
-                    device=device,
-                    threshold=threshold,
-                )
+            # update progress bar text
+            avg_loss = running_loss / max(1, num_updates)
+            progress.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "avg": f"{avg_loss:.4f}"
+            })
 
-                if not metrics_dev:
-                    print("  (no metrics from dev)")
-                else:
-                    uar = metrics_dev["UAR"]
-                    print(f"  Dev UAR = {uar:.4f}, macro F1 = {metrics_dev['macro_f1']:.4f}")
+        # ----- end of epoch: report training loss -----
+        if num_updates > 0:
+            avg_loss = running_loss / num_updates
+        else:
+            avg_loss = float("nan")
+        print(f"\n[Epoch {epoch}] avg training loss = {avg_loss:.4f}")
 
-                    if uar > best_uar:
-                        best_uar = uar
-                        best_metrics = metrics_dev
-                        best_step = global_step
-                        eval_count_since_best = 0
-                        torch.save(model.state_dict(), save_best_path)
-                        print(f"  --> New best model saved to {save_best_path}")
-                    else:
-                        eval_count_since_best += 1
-                        print(f"  No improvement. evals_since_best = {eval_count_since_best}")
+        # ----- evaluate on dev set -----
+        print(f"[Epoch {epoch}] Evaluating on dev set...")
+        metrics_dev = evaluate(
+            model=model,
+            segments=dev_segments,
+            word_dir=word_dir,
+            device=device,
+            threshold=threshold,
+        )
 
-                    if eval_count_since_best >= patience_evals:
-                        print("\nEarly stopping: patience reached.")
-                        break
+        if not metrics_dev:
+            print("  (no metrics from dev – check your data)")
+            continue
 
-        if eval_count_since_best >= patience_evals:
+        uar = metrics_dev["UAR"]
+        macro_f1 = metrics_dev["macro_f1"]
+        print(f"[Epoch {epoch}] Dev UAR = {uar:.4f}, macro F1 = {macro_f1:.4f}")
+
+        # ----- early stopping based on UAR -----
+        if uar > best_uar:
+            best_uar = uar
+            best_metrics = metrics_dev
+            best_epoch = epoch
+            epochs_without_improve = 0
+            torch.save(model.state_dict(), save_best_path)
+            print(f"  --> New best model saved to {save_best_path}")
+        else:
+            epochs_without_improve += 1
+            print(f"  No improvement in UAR. epochs_without_improve = {epochs_without_improve}")
+
+        if patience_epochs is not None and epochs_without_improve >= patience_epochs:
+            print("\nEarly stopping: no UAR improvement for "
+                  f"{patience_epochs} consecutive epochs.")
             break
 
     print("\nTraining finished.")
     if best_uar >= 0:
-        print(f"Best UAR={best_uar:.4f} at step {best_step}")
+        print(f"Best UAR={best_uar:.4f} at epoch {best_epoch}")
         print("Best dev metrics:")
         for lbl in LABELS:
             m = best_metrics[lbl]
@@ -488,39 +508,41 @@ if __name__ == "__main__":
                         help="Path to dev/validation metadata CSV.")
 
     parser.add_argument("--audio_dir", type=str, required=True,
-                        help="Directory containing speaker WAV files (e.g., 24fb.wav).")
+                        help="Directory containing speaker audio files (e.g., 24fb.wav or .mp3).")
 
     parser.add_argument("--word_dir", type=str, required=True,
                         help="Directory containing per-segment word-level CSV files (e.g., 24fb_000.csv).")
 
     parser.add_argument("--acoustic_checkpoint", type=str, required=True,
-                        help="Path to pretrained acoustic model (acoustic.pt).")
+                        help="Path to pretrained acoustic model (acoustic.pt from original repo).")
 
-    parser.add_argument("--device", type=str, default="cuda",
+    default_device = "cuda" if torch.cuda.is_available() else "cpu"
+    parser.add_argument("--device", type=str, default=default_device,
                         help="Device to use (cuda or cpu).")
 
     parser.add_argument("--num_epochs", type=int, default=15,
-                        help="Max number of epochs (paper trains up to ~15).")
+                        help="Maximum number of epochs.")
 
     parser.add_argument("--lr", type=float, default=1e-5,
-                        help="Learning rate (try {1e-4, 5e-5, 1e-5}).")
-
-    parser.add_argument("--eval_every", type=int, default=100,
-                        help="Evaluate dev set every N training segments.")
-
-    parser.add_argument("--patience_evals", type=int, default=50,
-                        help="Early-stop patience (in number of eval calls).")
+                        help="Learning rate (try 1e-4, 5e-5, 1e-5).")
 
     parser.add_argument("--threshold", type=float, default=0.5,
-                        help="Decision threshold used for evaluation.")
+                        help="Decision threshold for evaluation metrics.")
 
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed for reproducibility.")
+
+    parser.add_argument("--patience_epochs", type=int, default=5,
+                        help="Early stopping patience (in epochs without UAR improvement). "
+                             "Set to 0 or negative to disable early stopping.")
 
     parser.add_argument("--save_best_path", type=str, default="best_fluencybank_wavlm.pt",
                         help="Where to save the best model (based on dev UAR).")
 
     args = parser.parse_args()
+
+    # disable early stopping if user sets patience <= 0
+    patience = args.patience_epochs if args.patience_epochs > 0 else None
 
     train_fluencybank(
         train_metadata_path=args.train_meta,
@@ -531,10 +553,8 @@ if __name__ == "__main__":
         device=args.device,
         num_epochs=args.num_epochs,
         lr=args.lr,
-        eval_every=args.eval_every,
-        patience_evals=args.patience_evals,
         threshold=args.threshold,
         seed=args.seed,
+        patience_epochs=patience,
         save_best_path=args.save_best_path,
     )
-
