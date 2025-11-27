@@ -181,10 +181,9 @@ Training design:
     --audio_dir data/FluencyBank_Wav \
     --word_dir data/FluencyBank_TimeStamped/csvs/csvs \
     --output_weights checkpoints/acoustic_fluencybank.pt \
-    --batch_size 4 \
+    --num_epochs 15 \
     --lr 1e-4 \
-    --eval_every 100 \
-    --patience_evals 10 \
+    --patience_epochs 5 \
     --device cuda
 ```
 
