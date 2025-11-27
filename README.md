@@ -151,13 +151,21 @@ Fine-tuning on FluencyBank yielded consistent improvements across most disfluenc
 
 ## Acoustic_Based_Model
 
-### ✔️ 1. Loaded Original Switchboard Weights
+### ✔️ 1. Download the FluencyBanck's audio files
+Disfluency annotations are available only for the **FluencyBank English Voices–AWS Corpus**, which is open-source. The original dataset provides interview and reading videos of individuals who stutter. We’ve put significant effort into downloading the source files, converting them to `.wav`, and uploading the processed version to our HuggingFace dataset.
+
+You can download the audio files using the command below:
+```bash
+!gdown https://huggingface.co/datasets/HosseinRanjbar/FluencyBank/resolve/main/voice.zip
+```
+
+### ✔️ 2. Loaded Original Switchboard Weights
 The model is initialized using the publicly released **Switchboard-trained acoustic model weights**, ensuring continuity with the original methodology.
 ```bash
 !gdown --id 1wWrmopvvdhlBw-cL7EDyih9zn_IJu5Wr -O checkpoints/acoustic.pt
 ```
 
-### ✔️ 2. Demo - Test a single audio file
+### ✔️ 3. Demo - Test a single audio file
 
 ```bash
 !python /acoustic_based_model/demo.py --audio_path /voice-example/24fb.wav \
@@ -166,7 +174,7 @@ The model is initialized using the publicly released **Switchboard-trained acous
  --weights_path checkpoints/language_fluencybank.pt 
 ```
 
-### ✔️ 3. Fine-Tuned on FluencyBank
+### ✔️ 4. Fine-Tuned on FluencyBank
 Training design:
 - BCEWithLogitsLoss for multi-label prediction  
 - Step-based evaluation (every N training steps)  
@@ -187,7 +195,7 @@ Training design:
     --device cuda
 ```
 
-### ✔️ 4. Evaluated the Model
+### ✔️ 5. Evaluated the Model
 
 ```bash
 !python acoustic_based_model/test.py \
