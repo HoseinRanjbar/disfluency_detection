@@ -227,7 +227,15 @@ def evaluate_single_speaker(
     waveform = load_full_audio(audio_path, target_sr=SAMPLE_RATE).to(device)
 
     # Load metadata rows for this speaker
-    meta_spk = load_metadata_for_speaker(metadata_path, speaker_id)
+    try:
+        meta_spk = load_metadata_for_speaker(metadata_path, speaker_id)
+    except ValueError:
+        print(f"  No segments found in metadata for speaker_id='{speaker_id}', skipping this file.")
+        return (
+            np.zeros((0, len(LABELS))),
+            np.zeros((0, len(LABELS))),
+            {}
+        )
 
     all_true = []
     all_logits = []
@@ -411,4 +419,5 @@ if __name__ == "__main__":
         threshold=args.threshold,
         verbose=args.verbose,
     )
+
 
