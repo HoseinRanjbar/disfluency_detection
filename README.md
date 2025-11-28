@@ -190,7 +190,7 @@ Training design:
     --word_dir data/FluencyBank_TimeStamped/csvs/csvs \
     --output_weights checkpoints/acoustic_fluencybank.pt \
     --num_epochs 15 \
-    --lr 1e-4 \
+    --lr 1e-5 \
     --patience_epochs 5 \
     --device cuda
 ```
@@ -206,4 +206,20 @@ Training design:
     --device cuda \
     --threshold 0.5
 ```
+
+### Acoustic Model – Frame-Level Performance (All Files)
+
+| Class | Precision (Before) | Recall (Before) | F1 (Before) | Precision (After) | Recall (After) | F1 (After) |
+|-------|--------------------|-----------------|------------|-------------------|----------------|-----------|
+| **FP** | 0.4686 | 0.7246 | 0.5691 | **0.4470** | **0.8524** | **0.5864** |
+| **RP** | 0.2766 | 0.3132 | 0.2938 | **0.1599** | **0.7894** | **0.2660** |
+| **RV** | 0.0947 | 0.4874 | 0.1586 | **0.0991** | **0.2485** | **0.1417** |
+| **PW** | 0.1846 | 0.3336 | 0.2377 | **0.1222** | **0.5862** | **0.2022** |
+
+### Macro Metrics (5 Disfluency Classes)
+
+| Metric | Before Fine-Tuning | After Fine-Tuning |
+|--------|---------------------|--------------------|
+| **UAR** | 0.3718 | **0.4953** |
+| **Macro F1** | 0.2518 | **0.2393** |
 
