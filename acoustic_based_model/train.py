@@ -139,6 +139,62 @@ def load_segments_from_metadata(
     print(f"Loaded {len(segments)} segments from {metadata_path} (after skipping missing audio).")
     return segments
 
+def estimate_pos_weights(
+    train_segments: List[SegmentInfo],
+    word_dir: str,
+) -> np.ndarray:
+    """
+    Estimate pos_weight for BCEWithLogitsLoss:
+      pos_weight[c] = (#negative_frames_c / #positive_frames_c)
+
+    using the SAME label-building function as training/eval.
+    """
+    total_pos = np.zeros(len(LABELS), dtype=np.float64)
+    total_frames = 0
+
+    for seg in train_segments:
+        # fake n_frames_model just to use label builder:
+        # we only care about the relative distribution of labels,
+        # so pick some T (e.g. 100) and time span seg.seg_end-seg.seg_start
+        duration = seg.seg_end - seg.seg_start
+        if duration <= 0:
+            continue
+
+        # use T=100 frames for counting (resolution doesn't matter much here)
+        T = 100
+        labels = build_frame_labels_from_words(
+            word_dir=word_dir,
+            segid=seg.segid,
+            seg_start=seg.seg_start,
+            seg_end=seg.seg_end,
+            n_frames_model=T,
+        )  # [T, 5]
+
+        total_pos += labels.sum(axis=0)
+        total_frames += labels.shape[0]
+
+    # avoid division by zero
+    total_pos = np.maximum(total_pos, 1.0)
+    total_neg = total_frames - total_pos
+    total_neg = np.maximum(total_neg, 1.0)
+
+    ratio = total_neg / total_pos
+
+    # soften the effect: sqrt and clip
+    pos_weight = np.sqrt(ratio)              # weaker than ratio
+    pos_weight = np.clip(pos_weight, 1.0, 10.0)  # don't let any weight explode
+
+    # RS is always zero -> keep neutral
+    RS_index = LABELS.index("RS")
+    pos_weight[RS_index] = 1.0
+
+    print("[DEBUG] Final pos_weight per label:", dict(zip(LABELS, pos_weight)))
+
+
+    print("[DEBUG] Estimated pos_weight per label:", dict(zip(LABELS, pos_weight)))
+    return pos_weight
+
+
 # ========== BUILD FRAME LABELS ON MODEL GRID ========== #
 
 def build_frame_labels_from_words(
@@ -314,6 +370,16 @@ def evaluate(
 
     y_true = np.concatenate(all_true, axis=0)
     y_logits = np.concatenate(all_logits, axis=0)
+    # 🔍 DEBUG: check how many positives we have in GT and predictions
+    y_prob = 1.0 / (1.0 + np.exp(-y_logits))
+    y_pred = (y_prob >= threshold).astype(int)
+
+    print("\n[DEBUG] Dev label / prediction stats:")
+    for i, lbl in enumerate(LABELS):
+        gt_pos = int(y_true[:, i].sum())
+        pred_pos = int(y_pred[:, i].sum())
+        print(f"  {lbl}: GT positives={gt_pos}, Pred positives={pred_pos}")
+        
     return compute_metrics(y_true, y_logits, threshold=threshold)
 
 
@@ -353,10 +419,12 @@ def train_fluencybank(
     dev_segments = load_segments_from_metadata(dev_metadata_path, audio_dir)
     print(f"Train segments: {len(train_segments)} | Dev segments: {len(dev_segments)}")
 
+    # Estimate pos_weight from train labels
+    pos_weight_np = estimate_pos_weights(train_segments, word_dir)
+
     # ----- model -----
     model = AcousticModel()
 
-    # Load pretrained acoustic model weights (WavLM + classifier)
     if not os.path.exists(acoustic_checkpoint):
         raise FileNotFoundError(f"acoustic_checkpoint not found: {acoustic_checkpoint}")
     print(f"Loading pretrained acoustic model from: {acoustic_checkpoint}")
@@ -367,7 +435,7 @@ def train_fluencybank(
     if unexpected:
         print("  Unexpected keys in checkpoint:", unexpected)
 
-    # Freeze convolutional layers (feature extractor), as in paper
+    # Freeze conv layers
     for p in model.basemodel.feature_extractor.parameters():
         p.requires_grad = False
 
@@ -378,7 +446,11 @@ def train_fluencybank(
     print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
-    criterion = nn.BCEWithLogitsLoss()
+
+    ####### for solve unbalance data #################
+    pos_weight_tensor = torch.tensor(pos_weight_np, dtype=torch.float32, device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+    #criterion = nn.BCEWithLogitsLoss()
 
     global_step = 0
     best_uar = -1.0
