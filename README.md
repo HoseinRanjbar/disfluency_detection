@@ -195,6 +195,17 @@ Training design:
     --device cuda
 ```
 
+📥 Download the Fine-Tuned Model Weights
+
+```bash
+from huggingface_hub import hf_hub_download
+
+checkpoint_path = hf_hub_download(
+    repo_id="HosseinRanjbar/disfluency_detection",
+    filename="acoustic_model_ff.pth"
+)
+```
+
 ### ✔️ 5. Evaluated the Model
 
 ```bash
