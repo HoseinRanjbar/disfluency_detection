@@ -17,7 +17,6 @@ from transformers import WavLMModel
 LABELS = ["FP", "RP", "RV", "RS", "PW"]
 SAMPLE_RATE = 16000  # WavLM expects 16k
 
-
 # ================== MODEL DEFINITION ================== #
 
 class AcousticModel(nn.Module):
@@ -142,6 +141,8 @@ def load_segments_from_metadata(
 def estimate_pos_weights(
     train_segments: List[SegmentInfo],
     word_dir: str,
+    alpha: float = 0.3,      # how strong to push rare classes (>0, <1)
+    max_weight: float = 5.0  # upper limit on pos_weight
 ) -> np.ndarray:
     """
     Estimate pos_weight for BCEWithLogitsLoss:
@@ -178,22 +179,22 @@ def estimate_pos_weights(
     total_neg = total_frames - total_pos
     total_neg = np.maximum(total_neg, 1.0)
 
-    ratio = total_neg / total_pos
+    raw_ratio = total_neg / total_pos
 
-    # soften the effect: sqrt and clip
-    pos_weight = np.sqrt(ratio)              # weaker than ratio
-    pos_weight = np.clip(pos_weight, 1.0, 10.0)  # don't let any weight explode
+    # soften the effect: sqrt + blend toward 1 with factor alpha
+    w_raw = np.sqrt(raw_ratio)
+    pos_weight = 1.0 + alpha * (w_raw - 1.0)
+
+    # clip so nothing explodes
+    pos_weight = np.clip(pos_weight, 1.0, max_weight)
 
     # RS is always zero -> keep neutral
     RS_index = LABELS.index("RS")
     pos_weight[RS_index] = 1.0
 
+    print("[DEBUG] raw_ratio per label:", dict(zip(LABELS, raw_ratio)))
     print("[DEBUG] Final pos_weight per label:", dict(zip(LABELS, pos_weight)))
-
-
-    print("[DEBUG] Estimated pos_weight per label:", dict(zip(LABELS, pos_weight)))
     return pos_weight
-
 
 # ========== BUILD FRAME LABELS ON MODEL GRID ========== #
 
@@ -420,7 +421,7 @@ def train_fluencybank(
     print(f"Train segments: {len(train_segments)} | Dev segments: {len(dev_segments)}")
 
     # Estimate pos_weight from train labels
-    pos_weight_np = estimate_pos_weights(train_segments, word_dir)
+    pos_weight_np = estimate_pos_weights(train_segments=train_segments, word_dir=word_dir, alpha=0.3, max_weight=10)
 
     # ----- model -----
     model = AcousticModel()
@@ -441,6 +442,7 @@ def train_fluencybank(
 
     model.to(device)
 
+
     # Only train parameters that require grad (encoder + classifier)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
@@ -450,7 +452,7 @@ def train_fluencybank(
     ####### for solve unbalance data #################
     pos_weight_tensor = torch.tensor(pos_weight_np, dtype=torch.float32, device=device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-    #criterion = nn.BCEWithLogitsLoss()
+    # criterion = nn.BCEWithLogitsLoss()
 
     global_step = 0
     best_uar = -1.0
@@ -538,8 +540,12 @@ def train_fluencybank(
             best_metrics = metrics_dev
             best_epoch = epoch
             epochs_without_improve = 0
+
+            # 1) Save locally
             torch.save(model.state_dict(), save_best_path)
             print(f"  --> New best model saved to {save_best_path}")
+
+
         else:
             epochs_without_improve += 1
             print(f"  No improvement in UAR. epochs_without_improve = {epochs_without_improve}")
